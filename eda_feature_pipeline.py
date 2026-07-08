@@ -15,9 +15,9 @@ def log(msg=""):
     print(msg)
     log_lines.append(str(msg))
 
-# =============================================================================
-# PHASE 1 — SECURING INPUT FIDELITY
-# =============================================================================
+
+# SECURING INPUT FIDELITY
+
 log("=" * 80)
 log("PHASE 1: SECURING INPUT FIDELITY")
 log("=" * 80)
@@ -26,24 +26,14 @@ df = pd.read_excel(INPUT_PATH)
 raw_row_count = len(df)
 log(f"\nLoaded {raw_row_count} rows, {df.shape[1]} columns.")
 
-# -----------------------------------------------------------------------
-# 1A. MISSING DATA DECISION MATRIX
-# -----------------------------------------------------------------------
+
+# MISSING DATA DECISION MATRIX
+
 log("\n--- 1A. Missing Data Audit ---")
 missing_pct = (df.isna().mean() * 100).round(2)
 missing_report = missing_pct[missing_pct > 0]
 log(missing_report.to_string())
 
-# Only CouponCode has missing values (~25.75%) -> falls in the ">20%" bracket
-# of the deck's Decision Matrix, which prescribes "Multi-Dimensional Estimation
-# (KNN)". However, KNN imputation is designed for MCAR/MAR *continuous* signals
-# being estimated from neighboring records. Applying it blindly here would be
-# a misapplication of the rule, for two reasons we test explicitly below:
-#
-#   1. CouponCode is nominal (3 categories), not continuous -> KNN on a label
-#      with no natural geometry manufactures a false "closest" coupon.
-#   2. We must verify missingness is NOT a function of other fields (MAR) vs.
-#      a genuine business state ("no coupon was applied to this order").
 
 coupon_missing_flag = df['CouponCode'].isna()
 log("\nChi-square test: is CouponCode missingness associated with other fields?")
@@ -54,18 +44,14 @@ for col in ['OrderStatus', 'PaymentMethod', 'ReferralSource', 'Product']:
     assoc_results[col] = p
     log(f"  {col:<15s} p-value = {p:.4f}  -> {'associated' if p < 0.05 else 'NOT associated'}")
 
-# Decision: all p-values > 0.05 -> missingness is independent of order context.
-# This is structurally consistent with "no coupon used" rather than data loss.
-# CORRECT TREATMENT: explicit categorical imputation with a real business label,
-# NOT statistical mean/median/KNN (which would invent a fictitious coupon).
 df['CouponCode'] = df['CouponCode'].fillna('NoCouponUsed')
 log("\nDecision: Filled missing CouponCode with explicit category 'NoCouponUsed'.")
 log("Rationale: missingness is structural (MCAR, p>0.05 vs all tested fields),")
 log("representing a genuine 'no discount applied' state — not noise to estimate.")
 
-# -----------------------------------------------------------------------
-# 1B. OUTLIER DETECTION VIA INTERQUARTILE RANGE (IQR)
-# -----------------------------------------------------------------------
+
+# 1. OUTLIER DETECTION VIA INTERQUARTILE RANGE (IQR)
+
 log("\n--- 1B. Outlier Audit (IQR Method: Q1 - 1.5*IQR, Q3 + 1.5*IQR) ---")
 
 def iqr_bounds(series):
@@ -81,10 +67,7 @@ for col in numeric_audit_cols:
     outlier_summary[col] = {'lower': round(low, 2), 'upper': round(high, 2), 'count': int(mask.sum())}
     log(f"  {col:<12s} bounds=[{low:8.2f}, {high:8.2f}]  outliers={mask.sum()}")
 
-# Quantity, UnitPrice, ItemsInCart: 0 outliers -> clean, bounded business ranges.
-# TotalPrice: 8 flagged points. Verify whether these are genuine data errors
-# (hardware glitches / transcription errors per the deck) or legitimate
-# high-value transactions before touching them.
+
 max_plausible = df['Quantity'].max() * df['UnitPrice'].max()
 low_tp, high_tp = iqr_bounds(df['TotalPrice'])
 tp_outlier_mask = (df['TotalPrice'] < low_tp) | (df['TotalPrice'] > high_tp)
@@ -94,28 +77,22 @@ log(f"  All 8 flagged TotalPrice values sit between these two numbers,")
 log(f"  i.e. they are large but ARITHMETICALLY VALID combinations of")
 log(f"  legitimate Quantity x UnitPrice values — not corrupted data.")
 
-# Decision: do NOT winsorize (numpy.clip) or delete these rows. Capping a
-# real high-value order would destructively discard genuine revenue signal.
-# Instead, preserve the row and ENCODE the extremity as a feature (Phase 2)
-# so downstream estimators can use it as signal rather than have it silently
-# suppressed. This directly follows the deck's own warning: "the IQR isolates
-# extreme hardware glitches or human transcription errors" — these are neither.
+
 df['_is_high_value_outlier'] = tp_outlier_mask.astype(int)
 log("\nDecision: 8 TotalPrice outliers are legitimate, not erroneous.")
 log("Preserved as-is; flagged via new feature 'IsHighValueOrder' in Phase 2.")
 
 log(f"\nRow count after Phase 1 (no deletions): {len(df)} (unchanged from {raw_row_count})")
 
-# =============================================================================
-# PHASE 2 — THE VECTORIZED COMPUTATION ENGINE
-# =============================================================================
+# PHASE 2  THE VECTORIZED COMPUTATION ENGINE
+
 log("\n" + "=" * 80)
 log("PHASE 2: VECTORIZED COMPUTATION ENGINE")
 log("=" * 80)
 
-# -----------------------------------------------------------------------
+
 # 2A. FEATURE ENGINEERING (all vectorized — zero Python for-loops over rows)
-# -----------------------------------------------------------------------
+
 log("\n--- 2A. Engineering New Predictive Features ---")
 
 # Feature 1-4: Temporal decomposition of Date
@@ -130,36 +107,32 @@ log("  [1] OrderMonth, OrderQuarter, OrderDayOfWeek, IsWeekendOrder  <- Date dec
 df['HasCoupon'] = (df['CouponCode'] != 'NoCouponUsed').astype(int)
 log("  [2] HasCoupon                  <- binary discount-usage flag")
 
-# Feature 6: CartConversionRate — what share of the items a customer placed in
+# Feature 6: CartConversionRate  what share of the items a customer placed in
 # their cart were actually purchased. A behavioral signal IQR/Z-score cannot see.
 df['CartConversionRate'] = (df['Quantity'] / df['ItemsInCart']).round(4)
 log("  [3] CartConversionRate         <- Quantity / ItemsInCart")
 
-# Feature 7: IsHighValueOrder — carried over from the Phase 1 outlier audit.
+# Feature 7: IsHighValueOrder  carried over from the Phase 1 outlier audit.
 df.rename(columns={'_is_high_value_outlier': 'IsHighValueOrder'}, inplace=True)
 log("  [4] IsHighValueOrder           <- IQR-flagged extreme-but-valid order")
 
-# Feature 8: IsRepeatCustomer — vectorized groupby/transform, no loop.
+# Feature 8: IsRepeatCustomer vectorized groupby/transform, no loop.
 customer_order_counts = df.groupby('CustomerID')['OrderID'].transform('count')
 df['CustomerOrderCount'] = customer_order_counts
 df['IsRepeatCustomer'] = (customer_order_counts > 1).astype(int)
 log("  [5] CustomerOrderCount, IsRepeatCustomer  <- groupby().transform('count')")
 
 # Feature 9: UnitPriceZScore_byProduct — within-category Z-Score positioning.
-# Implements the deck's explicit Z-Score requirement: instead of a single
-# global Z-score (which would conflate Chairs with Laptops), the Z-score is
-# computed *within* each Product group so it answers "is this price high
-# relative to other items of the SAME product?" — a materially more useful
-# predictive signal for an estimator.
+
 grp = df.groupby('Product')['UnitPrice']
 df['UnitPriceZScore_byProduct'] = ((df['UnitPrice'] - grp.transform('mean')) / grp.transform('std')).round(4)
 log("  [6] UnitPriceZScore_byProduct  <- (UnitPrice - product mean) / product std")
 
 log(f"\nTotal new engineered features: 9 (requirement was >= 3)")
 
-# -----------------------------------------------------------------------
+
 # 2B. CATEGORICAL TRANSLATION INTO COORDINATE SPACE (One-Hot Encoding)
-# -----------------------------------------------------------------------
+
 log("\n--- 2B. One-Hot Encoding Nominal Categories ---")
 # Label Encoding is rejected per the deck: assigning ascending integers to
 # Product/PaymentMethod/etc. would manufacture a false ordinal hierarchy
@@ -169,9 +142,9 @@ log(f"  One-hot encoding: {categorical_cols}")
 df_encoded = pd.get_dummies(df, columns=categorical_cols, prefix=categorical_cols)
 log(f"  Shape after encoding: {df_encoded.shape}")
 
-# -----------------------------------------------------------------------
+
 # 2C. MULTICOLLINEARITY DIAGNOSTIC & ERADICATION
-# -----------------------------------------------------------------------
+
 log("\n--- 2C. Collinearity Eradication Algorithm ---")
 # Target for the demonstration: TotalPrice (continuous, natural regression target)
 target = 'TotalPrice'
@@ -210,9 +183,9 @@ else:
 
 log(f"\nFinal feature count after collinearity pass: {len(feature_cols)}")
 
-# =============================================================================
+
 # PHASE 3 — STRUCTURAL CONTRACTS (Runtime Schema Validation)
-# =============================================================================
+
 log("\n" + "=" * 80)
 log("PHASE 3: STRUCTURAL CONTRACTS (Pandera Runtime Validation)")
 log("=" * 80)
@@ -243,9 +216,8 @@ except pa.errors.SchemaErrors as err:
     validation_status = "FAIL"
     failure_log_df = err.failure_cases
 
-# =============================================================================
-# OUTPUT ARTIFACTS
-# =============================================================================
+
+
 log("\n" + "=" * 80)
 log("PIPELINE COMPLETE")
 log("=" * 80)
